@@ -597,10 +597,10 @@ pub mod pallet {
 				.cloned()
 				.collect::<std::collections::BTreeSet<_>>();
 
-			assert!(
-				endowed_accounts.len() == self.balances.len(),
-				"duplicate balances in genesis."
-			);
+			// assert!(
+			// 	endowed_accounts.len() == self.balances.len(),
+			// 	"duplicate balances in genesis."
+			// );
 
 			for &(ref who, free) in self.balances.iter() {
 				assert!(T::AccountStore::insert(who, AccountData { free, ..Default::default() })
