@@ -76,14 +76,19 @@ pub struct SharedParams {
 	pub tracing_targets: Option<String>,
 
 	/// Receiver to process tracing messages.
-	#[clap(long, value_name = "RECEIVER", arg_enum, ignore_case = true, default_value = "Log")]
+	#[clap(long, value_name = "RECEIVER", arg_enum, ignore_case = true, default_value = "log")]
 	pub tracing_receiver: TracingReceiver,
 }
 
 impl SharedParams {
 	/// Specify custom base path.
-	pub fn base_path(&self) -> Option<BasePath> {
-		self.base_path.clone().map(Into::into)
+	pub fn base_path(&self) -> Result<Option<BasePath>, crate::Error> {
+		match &self.base_path {
+			Some(r) => Ok(Some(r.clone().into())),
+			// If `dev` is enabled, we use the temp base path.
+			None if self.is_dev() => Ok(Some(BasePath::new_temp_dir()?)),
+			None => Ok(None),
+		}
 	}
 
 	/// Specify the development chain.
@@ -126,7 +131,7 @@ impl SharedParams {
 
 	/// Receiver to process tracing messages.
 	pub fn tracing_receiver(&self) -> sc_service::TracingReceiver {
-		self.tracing_receiver.clone().into()
+		self.tracing_receiver.into()
 	}
 
 	/// Comma separated list of targets for tracing.

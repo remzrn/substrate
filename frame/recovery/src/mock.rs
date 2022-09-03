@@ -47,7 +47,7 @@ frame_support::construct_runtime!(
 
 parameter_types! {
 	pub BlockWeights: frame_system::limits::BlockWeights =
-		frame_system::limits::BlockWeights::simple_max(1024);
+		frame_system::limits::BlockWeights::simple_max(frame_support::weights::Weight::from_ref_time(1024));
 }
 
 impl frame_system::Config for Test {
@@ -97,15 +97,18 @@ parameter_types! {
 	pub const ConfigDepositBase: u64 = 10;
 	pub const FriendDepositFactor: u64 = 1;
 	pub const RecoveryDeposit: u64 = 10;
+	// Large number of friends for benchmarking.
+	pub const MaxFriends: u32 = 128;
 }
 
 impl Config for Test {
 	type Event = Event;
+	type WeightInfo = ();
 	type Call = Call;
 	type Currency = Balances;
 	type ConfigDepositBase = ConfigDepositBase;
 	type FriendDepositFactor = FriendDepositFactor;
-	type MaxFriends = ConstU32<3>;
+	type MaxFriends = MaxFriends;
 	type RecoveryDeposit = RecoveryDeposit;
 }
 

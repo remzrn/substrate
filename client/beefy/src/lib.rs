@@ -16,22 +16,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
-
+use beefy_primitives::{BeefyApi, MmrRootHash};
 use prometheus::Registry;
-
 use sc_client_api::{Backend, BlockchainEvents, Finalizer};
+use sc_consensus::BlockImport;
 use sc_network_gossip::Network as GossipNetwork;
-
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
-use sp_consensus::SyncOracle;
+use sp_consensus::{Error as ConsensusError, SyncOracle};
 use sp_keystore::SyncCryptoStorePtr;
+use sp_mmr_primitives::MmrApi;
 use sp_runtime::traits::Block;
-
-use beefy_primitives::BeefyApi;
-
-use crate::notification::{BeefyBestBlockSender, BeefySignedCommitmentSender};
+use std::sync::Arc;
 
 mod error;
 mod gossip;
@@ -40,19 +36,29 @@ mod metrics;
 mod round;
 mod worker;
 
+pub mod import;
+pub mod justification;
 pub mod notification;
 
 #[cfg(test)]
 mod tests;
+
+use crate::{
+	import::BeefyBlockImport,
+	notification::{
+		BeefyBestBlockSender, BeefyBestBlockStream, BeefyVersionedFinalityProofSender,
+		BeefyVersionedFinalityProofStream,
+	},
+};
 
 pub use beefy_protocol_name::standard_name as protocol_standard_name;
 
 pub(crate) mod beefy_protocol_name {
 	use sc_chain_spec::ChainSpec;
 
-	const NAME: &'static str = "/beefy/1";
+	const NAME: &str = "/beefy/1";
 	/// Old names for the notifications protocol, used for backward compatibility.
-	pub(crate) const LEGACY_NAMES: [&'static str; 1] = ["/paritytech/beefy/1"];
+	pub(crate) const LEGACY_NAMES: [&str; 1] = ["/paritytech/beefy/1"];
 
 	/// Name of the notifications protocol used by BEEFY.
 	///
@@ -87,7 +93,7 @@ pub fn beefy_peers_set_config(
 /// of today, Rust does not allow a type alias to be used as a trait bound. Tracking
 /// issue is <https://github.com/rust-lang/rust/issues/41517>.
 pub trait Client<B, BE>:
-	BlockchainEvents<B> + HeaderBackend<B> + Finalizer<B, BE> + ProvideRuntimeApi<B> + Send + Sync
+	BlockchainEvents<B> + HeaderBackend<B> + Finalizer<B, BE> + Send + Sync
 where
 	B: Block,
 	BE: Backend<B>,
@@ -109,57 +115,120 @@ where
 	// empty
 }
 
+/// Links between the block importer, the background voter and the RPC layer,
+/// to be used by the voter.
+#[derive(Clone)]
+pub struct BeefyVoterLinks<B: Block> {
+	// BlockImport -> Voter links
+	/// Stream of BEEFY signed commitments from block import to voter.
+	pub from_block_import_justif_stream: BeefyVersionedFinalityProofStream<B>,
+
+	// Voter -> RPC links
+	/// Sends BEEFY signed commitments from voter to RPC.
+	pub to_rpc_justif_sender: BeefyVersionedFinalityProofSender<B>,
+	/// Sends BEEFY best block hashes from voter to RPC.
+	pub to_rpc_best_block_sender: BeefyBestBlockSender<B>,
+}
+
+/// Links used by the BEEFY RPC layer, from the BEEFY background voter.
+#[derive(Clone)]
+pub struct BeefyRPCLinks<B: Block> {
+	/// Stream of signed commitments coming from the voter.
+	pub from_voter_justif_stream: BeefyVersionedFinalityProofStream<B>,
+	/// Stream of BEEFY best block hashes coming from the voter.
+	pub from_voter_best_beefy_stream: BeefyBestBlockStream<B>,
+}
+
+/// Make block importer and link half necessary to tie the background voter to it.
+pub fn beefy_block_import_and_links<B, BE, RuntimeApi, I>(
+	wrapped_block_import: I,
+	backend: Arc<BE>,
+	runtime: Arc<RuntimeApi>,
+) -> (BeefyBlockImport<B, BE, RuntimeApi, I>, BeefyVoterLinks<B>, BeefyRPCLinks<B>)
+where
+	B: Block,
+	BE: Backend<B>,
+	I: BlockImport<B, Error = ConsensusError, Transaction = sp_api::TransactionFor<RuntimeApi, B>>
+		+ Send
+		+ Sync,
+	RuntimeApi: ProvideRuntimeApi<B> + Send + Sync,
+	RuntimeApi::Api: BeefyApi<B>,
+{
+	// Voter -> RPC links
+	let (to_rpc_justif_sender, from_voter_justif_stream) =
+		notification::BeefyVersionedFinalityProofStream::<B>::channel();
+	let (to_rpc_best_block_sender, from_voter_best_beefy_stream) =
+		notification::BeefyBestBlockStream::<B>::channel();
+
+	// BlockImport -> Voter links
+	let (to_voter_justif_sender, from_block_import_justif_stream) =
+		notification::BeefyVersionedFinalityProofStream::<B>::channel();
+
+	// BlockImport
+	let import =
+		BeefyBlockImport::new(backend, runtime, wrapped_block_import, to_voter_justif_sender);
+	let voter_links = BeefyVoterLinks {
+		from_block_import_justif_stream,
+		to_rpc_justif_sender,
+		to_rpc_best_block_sender,
+	};
+	let rpc_links = BeefyRPCLinks { from_voter_best_beefy_stream, from_voter_justif_stream };
+
+	(import, voter_links, rpc_links)
+}
+
 /// BEEFY gadget initialization parameters.
-pub struct BeefyParams<B, BE, C, N>
+pub struct BeefyParams<B, BE, C, N, R>
 where
 	B: Block,
 	BE: Backend<B>,
 	C: Client<B, BE>,
-	C::Api: BeefyApi<B>,
+	R: ProvideRuntimeApi<B>,
+	R::Api: BeefyApi<B> + MmrApi<B, MmrRootHash>,
 	N: GossipNetwork<B> + Clone + SyncOracle + Send + Sync + 'static,
 {
 	/// BEEFY client
 	pub client: Arc<C>,
 	/// Client Backend
 	pub backend: Arc<BE>,
+	/// Runtime Api Provider
+	pub runtime: Arc<R>,
 	/// Local key store
 	pub key_store: Option<SyncCryptoStorePtr>,
 	/// Gossip network
 	pub network: N,
-	/// BEEFY signed commitment sender
-	pub signed_commitment_sender: BeefySignedCommitmentSender<B>,
-	/// BEEFY best block sender
-	pub beefy_best_block_sender: BeefyBestBlockSender<B>,
 	/// Minimal delta between blocks, BEEFY should vote for
 	pub min_block_delta: u32,
 	/// Prometheus metric registry
 	pub prometheus_registry: Option<Registry>,
 	/// Chain specific GRANDPA protocol name. See [`beefy_protocol_name::standard_name`].
 	pub protocol_name: std::borrow::Cow<'static, str>,
+	/// Links between the block importer, the background voter and the RPC layer.
+	pub links: BeefyVoterLinks<B>,
 }
 
-#[cfg(not(test))]
 /// Start the BEEFY gadget.
 ///
 /// This is a thin shim around running and awaiting a BEEFY worker.
-pub async fn start_beefy_gadget<B, BE, C, N>(beefy_params: BeefyParams<B, BE, C, N>)
+pub async fn start_beefy_gadget<B, BE, C, N, R>(beefy_params: BeefyParams<B, BE, C, N, R>)
 where
 	B: Block,
 	BE: Backend<B>,
 	C: Client<B, BE>,
-	C::Api: BeefyApi<B>,
+	R: ProvideRuntimeApi<B>,
+	R::Api: BeefyApi<B> + MmrApi<B, MmrRootHash>,
 	N: GossipNetwork<B> + Clone + SyncOracle + Send + Sync + 'static,
 {
 	let BeefyParams {
 		client,
 		backend,
+		runtime,
 		key_store,
 		network,
-		signed_commitment_sender,
-		beefy_best_block_sender,
 		min_block_delta,
 		prometheus_registry,
 		protocol_name,
+		links,
 	} = beefy_params;
 
 	let sync_oracle = network.clone();
@@ -188,17 +257,17 @@ where
 	let worker_params = worker::WorkerParams {
 		client,
 		backend,
+		runtime,
+		sync_oracle,
 		key_store: key_store.into(),
-		signed_commitment_sender,
-		beefy_best_block_sender,
 		gossip_engine,
 		gossip_validator,
-		min_block_delta,
+		links,
 		metrics,
-		sync_oracle,
+		min_block_delta,
 	};
 
-	let worker = worker::BeefyWorker::<_, _, _, _>::new(worker_params);
+	let worker = worker::BeefyWorker::<_, _, _, _, _>::new(worker_params);
 
 	worker.run().await
 }

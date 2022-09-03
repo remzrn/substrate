@@ -566,7 +566,7 @@ where
 			ViableEpochDescriptor::UnimportedGenesis(slot) =>
 				Some(ViableEpoch::UnimportedGenesis(make_genesis(*slot))),
 			ViableEpochDescriptor::Signaled(identifier, _) =>
-				self.epoch(&identifier).map(ViableEpoch::Signaled),
+				self.epoch(identifier).map(ViableEpoch::Signaled),
 		}
 	}
 
@@ -599,7 +599,7 @@ where
 			ViableEpochDescriptor::UnimportedGenesis(slot) =>
 				Some(ViableEpoch::UnimportedGenesis(make_genesis(*slot))),
 			ViableEpochDescriptor::Signaled(identifier, _) =>
-				self.epoch_mut(&identifier).map(ViableEpoch::Signaled),
+				self.epoch_mut(identifier).map(ViableEpoch::Signaled),
 		}
 	}
 
@@ -618,7 +618,7 @@ where
 	{
 		match descriptor {
 			ViableEpochDescriptor::UnimportedGenesis(slot) => Some(make_genesis(*slot)),
-			ViableEpochDescriptor::Signaled(identifier, _) => self.epoch(&identifier).cloned(),
+			ViableEpochDescriptor::Signaled(identifier, _) => self.epoch(identifier).cloned(),
 		}
 	}
 
@@ -750,12 +750,15 @@ where
 
 		if let Some(gap) = &mut self.gap {
 			if let PersistedEpoch::Regular(e) = epoch {
-				epoch = match gap.import(slot, hash.clone(), number.clone(), e) {
+				epoch = match gap.import(slot, hash, number, e) {
 					Ok(()) => return Ok(()),
 					Err(e) => PersistedEpoch::Regular(e),
 				}
 			}
-		} else if epoch.is_genesis() && !self.epochs.values().all(|e| e.is_genesis()) {
+		} else if epoch.is_genesis() &&
+			!self.epochs.is_empty() &&
+			!self.epochs.values().any(|e| e.is_genesis())
+		{
 			// There's a genesis epoch imported when we already have an active epoch.
 			// This happens after the warp sync as the ancient blocks download start.
 			// We need to start tracking gap epochs here.
@@ -1060,7 +1063,7 @@ mod tests {
 			let incremented_epoch = epoch_changes
 				.viable_epoch(&genesis_epoch_a_descriptor, &make_genesis)
 				.unwrap()
-				.increment(next_descriptor.clone());
+				.increment(next_descriptor);
 
 			epoch_changes
 				.import(&is_descendent_of, *b"A", 1, *b"0", incremented_epoch)
@@ -1077,7 +1080,7 @@ mod tests {
 			let incremented_epoch = epoch_changes
 				.viable_epoch(&genesis_epoch_x_descriptor, &make_genesis)
 				.unwrap()
-				.increment(next_descriptor.clone());
+				.increment(next_descriptor);
 
 			epoch_changes
 				.import(&is_descendent_of, *b"X", 1, *b"0", incremented_epoch)
@@ -1142,7 +1145,7 @@ mod tests {
 			let incremented_epoch = epoch_changes
 				.viable_epoch(&genesis_epoch_a_descriptor, &make_genesis)
 				.unwrap()
-				.increment(next_descriptor.clone());
+				.increment(next_descriptor);
 
 			epoch_changes
 				.import(&is_descendent_of, *b"A", 1, *b"0", incremented_epoch)
@@ -1159,7 +1162,7 @@ mod tests {
 			let incremented_epoch = epoch_changes
 				.viable_epoch(&genesis_epoch_x_descriptor, &make_genesis)
 				.unwrap()
-				.increment(next_descriptor.clone());
+				.increment(next_descriptor);
 
 			epoch_changes
 				.import(&is_descendent_of, *b"X", 1, *b"0", incremented_epoch)
@@ -1170,15 +1173,17 @@ mod tests {
 		epoch_changes.clear_gap();
 
 		// Check that both epochs are available.
-		epoch_changes
+		let epoch_a = epoch_changes
 			.epoch_data_for_child_of(&is_descendent_of, b"A", 1, 101, &make_genesis)
 			.unwrap()
 			.unwrap();
 
-		epoch_changes
+		let epoch_x = epoch_changes
 			.epoch_data_for_child_of(&is_descendent_of, b"X", 1, 1001, &make_genesis)
 			.unwrap()
 			.unwrap();
+
+		assert!(epoch_a != epoch_x)
 	}
 
 	#[test]
@@ -1215,7 +1220,7 @@ mod tests {
 		let incremented_epoch = epoch_changes
 			.viable_epoch(&genesis_epoch_a_descriptor, &make_genesis)
 			.unwrap()
-			.increment(next_descriptor.clone());
+			.increment(next_descriptor);
 
 		epoch_changes
 			.import(&is_descendent_of, *b"1", 1, *b"0", incremented_epoch)
@@ -1287,5 +1292,109 @@ mod tests {
 
 		epoch_changes.clear_gap();
 		assert!(epoch_changes.gap.is_none());
+	}
+
+	/// Test that ensures that the gap is not enabled when there's still genesis
+	/// epochs imported, regardless of whether there are already other further
+	/// epochs imported descending from such genesis epochs.
+	#[test]
+	fn gap_is_not_enabled_when_at_least_one_genesis_epoch_is_still_imported() {
+		//     A (#1) - B (#201)
+		//   /
+		// 0 - C (#1)
+		//
+		// The epoch duration is 100 slots, each of these blocks represents
+		// an epoch change block. block B starts a new epoch at #201 since the
+		// genesis epoch spans two epochs.
+
+		let is_descendent_of = |base: &Hash, block: &Hash| -> Result<bool, TestError> {
+			match (base, block) {
+				(b"0", _) => Ok(true),
+				(b"A", b"B") => Ok(true),
+				_ => Ok(false),
+			}
+		};
+
+		let duration = 100;
+		let make_genesis = |slot| Epoch { start_slot: slot, duration };
+		let mut epoch_changes = EpochChanges::new();
+		let next_descriptor = ();
+
+		// insert genesis epoch for A at slot 1
+		{
+			let genesis_epoch_a_descriptor = epoch_changes
+				.epoch_descriptor_for_child_of(&is_descendent_of, b"0", 0, 1)
+				.unwrap()
+				.unwrap();
+
+			let incremented_epoch = epoch_changes
+				.viable_epoch(&genesis_epoch_a_descriptor, &make_genesis)
+				.unwrap()
+				.increment(next_descriptor);
+
+			epoch_changes
+				.import(&is_descendent_of, *b"A", 1, *b"0", incremented_epoch)
+				.unwrap();
+		}
+
+		// insert regular epoch for B at slot 201, descending from A
+		{
+			let epoch_b_descriptor = epoch_changes
+				.epoch_descriptor_for_child_of(&is_descendent_of, b"A", 1, 201)
+				.unwrap()
+				.unwrap();
+
+			let incremented_epoch = epoch_changes
+				.viable_epoch(&epoch_b_descriptor, &make_genesis)
+				.unwrap()
+				.increment(next_descriptor);
+
+			epoch_changes
+				.import(&is_descendent_of, *b"B", 201, *b"A", incremented_epoch)
+				.unwrap();
+		}
+
+		// insert genesis epoch for C at slot 1000
+		{
+			let genesis_epoch_x_descriptor = epoch_changes
+				.epoch_descriptor_for_child_of(&is_descendent_of, b"0", 0, 1000)
+				.unwrap()
+				.unwrap();
+
+			let incremented_epoch = epoch_changes
+				.viable_epoch(&genesis_epoch_x_descriptor, &make_genesis)
+				.unwrap()
+				.increment(next_descriptor);
+
+			epoch_changes
+				.import(&is_descendent_of, *b"C", 1, *b"0", incremented_epoch)
+				.unwrap();
+		}
+
+		// Clearing the gap should be a no-op.
+		epoch_changes.clear_gap();
+
+		// Check that all three epochs are available.
+		let epoch_a = epoch_changes
+			.epoch_data_for_child_of(&is_descendent_of, b"A", 1, 10, &make_genesis)
+			.unwrap()
+			.unwrap();
+
+		let epoch_b = epoch_changes
+			.epoch_data_for_child_of(&is_descendent_of, b"B", 201, 201, &make_genesis)
+			.unwrap()
+			.unwrap();
+
+		assert!(epoch_a != epoch_b);
+
+		// the genesis epoch A will span slots [1, 200] with epoch B starting at slot 201
+		assert_eq!(epoch_b.start_slot(), 201);
+
+		let epoch_c = epoch_changes
+			.epoch_data_for_child_of(&is_descendent_of, b"C", 1, 1001, &make_genesis)
+			.unwrap()
+			.unwrap();
+
+		assert!(epoch_a != epoch_c);
 	}
 }

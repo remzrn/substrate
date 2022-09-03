@@ -23,7 +23,7 @@ use sc_block_builder::BlockBuilderProvider;
 use sc_client_api::{
 	in_mem, BlockBackend, BlockchainEvents, FinalityNotifications, StorageProvider,
 };
-use sc_client_db::{Backend, DatabaseSettings, DatabaseSource, KeepBlocks, PruningMode};
+use sc_client_db::{Backend, BlocksPruning, DatabaseSettings, DatabaseSource, PruningMode};
 use sc_consensus::{
 	BlockCheckParams, BlockImport, BlockImportParams, ForkChoiceStrategy, ImportResult,
 };
@@ -410,7 +410,7 @@ fn best_containing_with_genesis_block() {
 
 	assert_eq!(
 		genesis_hash.clone(),
-		block_on(longest_chain_select.finality_target(genesis_hash.clone(), None)).unwrap(),
+		block_on(longest_chain_select.finality_target(genesis_hash, None)).unwrap(),
 	);
 }
 
@@ -1011,12 +1011,16 @@ fn finalizing_diverged_block_should_trigger_reorg() {
 
 	assert_eq!(client.chain_info().best_hash, b3.hash());
 
-	finality_notification_check(&mut finality_notifications, &[b1.hash()], &[a2.hash()]);
+	ClientExt::finalize_block(&client, BlockId::Hash(b3.hash()), None).unwrap();
+
+	finality_notification_check(&mut finality_notifications, &[b1.hash()], &[]);
+	finality_notification_check(&mut finality_notifications, &[b2.hash(), b3.hash()], &[a2.hash()]);
 	assert!(finality_notifications.try_next().is_err());
 }
 
 #[test]
 fn finality_notifications_content() {
+	sp_tracing::try_init_simple();
 	let (mut client, _select_chain) = TestClientBuilder::new().build_with_longest_chain();
 
 	//               -> D3 -> D4
@@ -1110,12 +1114,8 @@ fn finality_notifications_content() {
 	// Import and finalize D4
 	block_on(client.import_as_final(BlockOrigin::Own, d4.clone())).unwrap();
 
-	finality_notification_check(
-		&mut finality_notifications,
-		&[a1.hash(), a2.hash()],
-		&[c1.hash(), b2.hash()],
-	);
-	finality_notification_check(&mut finality_notifications, &[d3.hash(), d4.hash()], &[a3.hash()]);
+	finality_notification_check(&mut finality_notifications, &[a1.hash(), a2.hash()], &[c1.hash()]);
+	finality_notification_check(&mut finality_notifications, &[d3.hash(), d4.hash()], &[b2.hash()]);
 	assert!(finality_notifications.try_next().is_err());
 }
 
@@ -1197,10 +1197,9 @@ fn doesnt_import_blocks_that_revert_finality() {
 	let backend = Arc::new(
 		Backend::new(
 			DatabaseSettings {
-				state_cache_size: 1 << 20,
-				state_cache_child_ratio: None,
-				state_pruning: PruningMode::ArchiveAll,
-				keep_blocks: KeepBlocks::All,
+				trie_cache_maximum_size: Some(1 << 20),
+				state_pruning: Some(PruningMode::ArchiveAll),
+				blocks_pruning: BlocksPruning::All,
 				source: DatabaseSource::RocksDb { path: tmp.path().into(), cache_size: 1024 },
 			},
 			u64::MAX,
@@ -1214,7 +1213,7 @@ fn doesnt_import_blocks_that_revert_finality() {
 
 	//    -> C1
 	//   /
-	// G -> A1 -> A2
+	// G -> A1 -> A2 -> A3
 	//   \
 	//    -> B1 -> B2 -> B3
 
@@ -1294,7 +1293,19 @@ fn doesnt_import_blocks_that_revert_finality() {
 
 	assert_eq!(import_err.to_string(), expected_err.to_string());
 
-	finality_notification_check(&mut finality_notifications, &[a1.hash(), a2.hash()], &[b2.hash()]);
+	let a3 = client
+		.new_block_at(&BlockId::Hash(a2.hash()), Default::default(), false)
+		.unwrap()
+		.build()
+		.unwrap()
+		.block;
+	block_on(client.import(BlockOrigin::Own, a3.clone())).unwrap();
+	ClientExt::finalize_block(&client, BlockId::Hash(a3.hash()), None).unwrap();
+
+	finality_notification_check(&mut finality_notifications, &[a1.hash(), a2.hash()], &[]);
+
+	finality_notification_check(&mut finality_notifications, &[a3.hash()], &[b2.hash()]);
+
 	assert!(finality_notifications.try_next().is_err());
 }
 
@@ -1321,9 +1332,9 @@ fn respects_block_rules() {
 			.block;
 
 		let params = BlockCheckParams {
-			hash: block_ok.hash().clone(),
+			hash: block_ok.hash(),
 			number: 0,
-			parent_hash: block_ok.header().parent_hash().clone(),
+			parent_hash: *block_ok.header().parent_hash(),
 			allow_missing_state: false,
 			allow_missing_parent: false,
 			import_existing: false,
@@ -1337,9 +1348,9 @@ fn respects_block_rules() {
 		let block_not_ok = block_not_ok.build().unwrap().block;
 
 		let params = BlockCheckParams {
-			hash: block_not_ok.hash().clone(),
+			hash: block_not_ok.hash(),
 			number: 0,
-			parent_hash: block_not_ok.header().parent_hash().clone(),
+			parent_hash: *block_not_ok.header().parent_hash(),
 			allow_missing_state: false,
 			allow_missing_parent: false,
 			import_existing: false,
@@ -1360,15 +1371,15 @@ fn respects_block_rules() {
 		let block_ok = block_ok.build().unwrap().block;
 
 		let params = BlockCheckParams {
-			hash: block_ok.hash().clone(),
+			hash: block_ok.hash(),
 			number: 1,
-			parent_hash: block_ok.header().parent_hash().clone(),
+			parent_hash: *block_ok.header().parent_hash(),
 			allow_missing_state: false,
 			allow_missing_parent: false,
 			import_existing: false,
 		};
 		if record_only {
-			fork_rules.push((1, block_ok.hash().clone()));
+			fork_rules.push((1, block_ok.hash()));
 		}
 		assert_eq!(block_on(client.check_block(params)).unwrap(), ImportResult::imported(false));
 
@@ -1379,9 +1390,9 @@ fn respects_block_rules() {
 		let block_not_ok = block_not_ok.build().unwrap().block;
 
 		let params = BlockCheckParams {
-			hash: block_not_ok.hash().clone(),
+			hash: block_not_ok.hash(),
 			number: 1,
-			parent_hash: block_not_ok.header().parent_hash().clone(),
+			parent_hash: *block_not_ok.header().parent_hash(),
 			allow_missing_state: false,
 			allow_missing_parent: false,
 			import_existing: false,
@@ -1412,10 +1423,9 @@ fn returns_status_for_pruned_blocks() {
 	let backend = Arc::new(
 		Backend::new(
 			DatabaseSettings {
-				state_cache_size: 1 << 20,
-				state_cache_child_ratio: None,
-				state_pruning: PruningMode::keep_blocks(1),
-				keep_blocks: KeepBlocks::All,
+				trie_cache_maximum_size: Some(1 << 20),
+				state_pruning: Some(PruningMode::blocks_pruning(1)),
+				blocks_pruning: BlocksPruning::All,
 				source: DatabaseSource::RocksDb { path: tmp.path().into(), cache_size: 1024 },
 			},
 			u64::MAX,
@@ -1445,9 +1455,9 @@ fn returns_status_for_pruned_blocks() {
 	let b1 = b1.build().unwrap().block;
 
 	let check_block_a1 = BlockCheckParams {
-		hash: a1.hash().clone(),
+		hash: a1.hash(),
 		number: 0,
-		parent_hash: a1.header().parent_hash().clone(),
+		parent_hash: *a1.header().parent_hash(),
 		allow_missing_state: false,
 		allow_missing_parent: false,
 		import_existing: false,
@@ -1482,9 +1492,9 @@ fn returns_status_for_pruned_blocks() {
 	block_on(client.import_as_final(BlockOrigin::Own, a2.clone())).unwrap();
 
 	let check_block_a2 = BlockCheckParams {
-		hash: a2.hash().clone(),
+		hash: a2.hash(),
 		number: 1,
-		parent_hash: a1.header().parent_hash().clone(),
+		parent_hash: *a1.header().parent_hash(),
 		allow_missing_state: false,
 		allow_missing_parent: false,
 		import_existing: false,
@@ -1516,9 +1526,9 @@ fn returns_status_for_pruned_blocks() {
 
 	block_on(client.import_as_final(BlockOrigin::Own, a3.clone())).unwrap();
 	let check_block_a3 = BlockCheckParams {
-		hash: a3.hash().clone(),
+		hash: a3.hash(),
 		number: 2,
-		parent_hash: a2.header().parent_hash().clone(),
+		parent_hash: *a2.header().parent_hash(),
 		allow_missing_state: false,
 		allow_missing_parent: false,
 		import_existing: false,
@@ -1551,9 +1561,9 @@ fn returns_status_for_pruned_blocks() {
 	);
 
 	let mut check_block_b1 = BlockCheckParams {
-		hash: b1.hash().clone(),
+		hash: b1.hash(),
 		number: 0,
-		parent_hash: b1.header().parent_hash().clone(),
+		parent_hash: *b1.header().parent_hash(),
 		allow_missing_state: false,
 		allow_missing_parent: false,
 		import_existing: false,

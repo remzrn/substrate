@@ -18,13 +18,17 @@
 //! Contains the root [`BenchmarkCmd`] command and exports its sub-commands.
 
 mod block;
+mod extrinsic;
+mod machine;
 mod overhead;
 mod pallet;
 mod shared;
 mod storage;
 
 pub use block::BlockCmd;
-pub use overhead::{ExtrinsicBuilder, OverheadCmd};
+pub use extrinsic::{ExtrinsicBuilder, ExtrinsicCmd, ExtrinsicFactory};
+pub use machine::{MachineCmd, Requirements, SUBSTRATE_REFERENCE_HARDWARE};
+pub use overhead::OverheadCmd;
 pub use pallet::PalletCmd;
 pub use storage::StorageCmd;
 
@@ -39,6 +43,8 @@ pub enum BenchmarkCmd {
 	Storage(StorageCmd),
 	Overhead(OverheadCmd),
 	Block(BlockCmd),
+	Machine(MachineCmd),
+	Extrinsic(ExtrinsicCmd),
 }
 
 /// Unwraps a [`BenchmarkCmd`] into its concrete sub-command.
@@ -53,6 +59,8 @@ macro_rules! unwrap_cmd {
 			BenchmarkCmd::Storage($cmd) => $code,
 			BenchmarkCmd::Overhead($cmd) => $code,
 			BenchmarkCmd::Block($cmd) => $code,
+			BenchmarkCmd::Machine($cmd) => $code,
+			BenchmarkCmd::Extrinsic($cmd) => $code,
 		}
 	}
 }
@@ -85,9 +93,9 @@ impl CliConfiguration for BenchmarkCmd {
 		}
 	}
 
-	fn state_cache_size(&self) -> Result<usize> {
+	fn trie_cache_maximum_size(&self) -> Result<Option<usize>> {
 		unwrap_cmd! {
-			self, cmd, cmd.state_cache_size()
+			self, cmd, cmd.trie_cache_maximum_size()
 		}
 	}
 

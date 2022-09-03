@@ -123,7 +123,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 
 parameter_types! {
 	pub BlockWeights: frame_system::limits::BlockWeights =
-		frame_system::limits::BlockWeights::simple_max(1024);
+		frame_system::limits::BlockWeights::simple_max(frame_support::weights::Weight::from_ref_time(1024));
 }
 
 impl frame_system::Config for Runtime {
@@ -218,17 +218,13 @@ impl frame_support::traits::EstimateNextSessionRotation<u64> for TestNextSession
 	}
 }
 
-parameter_types! {
-	pub const UnsignedPriority: u64 = 1 << 20;
-}
-
 impl Config for Runtime {
 	type AuthorityId = UintAuthorityId;
 	type Event = Event;
 	type ValidatorSet = Historical;
 	type NextSessionRotation = TestNextSessionRotation;
 	type ReportUnresponsiveness = OffenceHandler;
-	type UnsignedPriority = UnsignedPriority;
+	type UnsignedPriority = ConstU64<{ 1 << 20 }>;
 	type WeightInfo = ();
 	type MaxKeys = ConstU32<10_000>;
 	type MaxPeerInHeartbeats = ConstU32<10_000>;

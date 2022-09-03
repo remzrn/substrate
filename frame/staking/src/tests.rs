@@ -1082,10 +1082,7 @@ fn validator_payment_prefs_work() {
 	// This test will focus on validator payment.
 	ExtBuilder::default().build_and_execute(|| {
 		let commission = Perbill::from_percent(40);
-		<Validators<Test>>::insert(
-			&11,
-			ValidatorPrefs { commission: commission.clone(), ..Default::default() },
-		);
+		<Validators<Test>>::insert(&11, ValidatorPrefs { commission, ..Default::default() });
 
 		// Reward controller so staked ratio doesn't change.
 		<Payee<Test>>::insert(&11, RewardDestination::Controller);
@@ -2081,8 +2078,7 @@ fn reward_validator_slashing_validator_does_not_overflow() {
 		let _ = Balances::make_free_balance_be(&11, stake);
 		let _ = Balances::make_free_balance_be(&2, stake);
 
-		// only slashes out of bonded stake are applied. without this line,
-		// it is 0.
+		// only slashes out of bonded stake are applied. without this line, it is 0.
 		Staking::bond(Origin::signed(2), 20000, stake - 1, RewardDestination::default()).unwrap();
 		// Override exposure of 11
 		ErasStakers::<Test>::insert(
@@ -2778,12 +2774,177 @@ fn deferred_slashes_are_deferred() {
 		assert_eq!(Balances::free_balance(11), 1000);
 		assert_eq!(Balances::free_balance(101), 2000);
 
+		System::reset_events();
+
 		// at the start of era 4, slashes from era 1 are processed,
 		// after being deferred for at least 2 full eras.
 		mock::start_active_era(4);
 
 		assert_eq!(Balances::free_balance(11), 900);
 		assert_eq!(Balances::free_balance(101), 2000 - (nominated_value / 10));
+
+		assert_eq!(
+			staking_events_since_last_call(),
+			vec![
+				Event::StakersElected,
+				Event::EraPaid(3, 11075, 33225),
+				Event::Slashed(11, 100),
+				Event::Slashed(101, 12)
+			]
+		);
+	})
+}
+
+#[test]
+fn retroactive_deferred_slashes_two_eras_before() {
+	ExtBuilder::default().slash_defer_duration(2).build_and_execute(|| {
+		assert_eq!(BondingDuration::get(), 3);
+
+		mock::start_active_era(1);
+		let exposure_11_at_era1 = Staking::eras_stakers(active_era(), 11);
+
+		mock::start_active_era(3);
+		on_offence_in_era(
+			&[OffenceDetails { offender: (11, exposure_11_at_era1), reporters: vec![] }],
+			&[Perbill::from_percent(10)],
+			1, // should be deferred for two full eras, and applied at the beginning of era 4.
+			DisableStrategy::Never,
+		);
+		System::reset_events();
+
+		mock::start_active_era(4);
+
+		assert_eq!(
+			staking_events_since_last_call(),
+			vec![
+				Event::StakersElected,
+				Event::EraPaid(3, 7100, 21300),
+				Event::Slashed(11, 100),
+				Event::Slashed(101, 12)
+			]
+		);
+	})
+}
+
+#[test]
+fn retroactive_deferred_slashes_one_before() {
+	ExtBuilder::default().slash_defer_duration(2).build_and_execute(|| {
+		assert_eq!(BondingDuration::get(), 3);
+
+		mock::start_active_era(1);
+		let exposure_11_at_era1 = Staking::eras_stakers(active_era(), 11);
+
+		// unbond at slash era.
+		mock::start_active_era(2);
+		assert_ok!(Staking::chill(Origin::signed(10)));
+		assert_ok!(Staking::unbond(Origin::signed(10), 100));
+
+		mock::start_active_era(3);
+		on_offence_in_era(
+			&[OffenceDetails { offender: (11, exposure_11_at_era1), reporters: vec![] }],
+			&[Perbill::from_percent(10)],
+			2, // should be deferred for two full eras, and applied at the beginning of era 5.
+			DisableStrategy::Never,
+		);
+		System::reset_events();
+
+		mock::start_active_era(4);
+		assert_eq!(
+			staking_events_since_last_call(),
+			vec![Event::StakersElected, Event::EraPaid(3, 11075, 33225)]
+		);
+
+		assert_eq!(Staking::ledger(10).unwrap().total, 1000);
+		// slash happens after the next line.
+		mock::start_active_era(5);
+		assert_eq!(
+			staking_events_since_last_call(),
+			vec![
+				Event::StakersElected,
+				Event::EraPaid(4, 11075, 33225),
+				Event::Slashed(11, 100),
+				Event::Slashed(101, 12)
+			]
+		);
+
+		// their ledger has already been slashed.
+		assert_eq!(Staking::ledger(10).unwrap().total, 900);
+		assert_ok!(Staking::unbond(Origin::signed(10), 1000));
+		assert_eq!(Staking::ledger(10).unwrap().total, 900);
+	})
+}
+
+#[test]
+fn staker_cannot_bail_deferred_slash() {
+	// as long as SlashDeferDuration is less than BondingDuration, this should not be possible.
+	ExtBuilder::default().slash_defer_duration(2).build_and_execute(|| {
+		mock::start_active_era(1);
+
+		assert_eq!(Balances::free_balance(11), 1000);
+		assert_eq!(Balances::free_balance(101), 2000);
+
+		let exposure = Staking::eras_stakers(active_era(), 11);
+		let nominated_value = exposure.others.iter().find(|o| o.who == 101).unwrap().value;
+
+		on_offence_now(
+			&[OffenceDetails {
+				offender: (11, Staking::eras_stakers(active_era(), 11)),
+				reporters: vec![],
+			}],
+			&[Perbill::from_percent(10)],
+		);
+
+		// now we chill
+		assert_ok!(Staking::chill(Origin::signed(100)));
+		assert_ok!(Staking::unbond(Origin::signed(100), 500));
+
+		assert_eq!(Staking::current_era().unwrap(), 1);
+		assert_eq!(active_era(), 1);
+
+		assert_eq!(
+			Ledger::<Test>::get(100).unwrap(),
+			StakingLedger {
+				active: 0,
+				total: 500,
+				stash: 101,
+				claimed_rewards: Default::default(),
+				unlocking: bounded_vec![UnlockChunk { era: 4u32, value: 500 }],
+			}
+		);
+
+		// no slash yet.
+		assert_eq!(Balances::free_balance(11), 1000);
+		assert_eq!(Balances::free_balance(101), 2000);
+
+		// no slash yet.
+		mock::start_active_era(2);
+		assert_eq!(Balances::free_balance(11), 1000);
+		assert_eq!(Balances::free_balance(101), 2000);
+		assert_eq!(Staking::current_era().unwrap(), 2);
+		assert_eq!(active_era(), 2);
+
+		// no slash yet.
+		mock::start_active_era(3);
+		assert_eq!(Balances::free_balance(11), 1000);
+		assert_eq!(Balances::free_balance(101), 2000);
+		assert_eq!(Staking::current_era().unwrap(), 3);
+		assert_eq!(active_era(), 3);
+
+		// and cannot yet unbond:
+		assert_storage_noop!(assert!(Staking::withdraw_unbonded(Origin::signed(100), 0).is_ok()));
+		assert_eq!(
+			Ledger::<Test>::get(100).unwrap().unlocking.into_inner(),
+			vec![UnlockChunk { era: 4u32, value: 500 as Balance }],
+		);
+
+		// at the start of era 4, slashes from era 1 are processed,
+		// after being deferred for at least 2 full eras.
+		mock::start_active_era(4);
+
+		assert_eq!(Balances::free_balance(11), 900);
+		assert_eq!(Balances::free_balance(101), 2000 - (nominated_value / 10));
+
+		// and the leftover of the funds can now be unbonded.
 	})
 }
 
@@ -2798,6 +2959,7 @@ fn remove_deferred() {
 		assert_eq!(Balances::free_balance(101), 2000);
 		let nominated_value = exposure.others.iter().find(|o| o.who == 101).unwrap().value;
 
+		// deferred to start of era 4.
 		on_offence_now(
 			&[OffenceDetails { offender: (11, exposure.clone()), reporters: vec![] }],
 			&[Perbill::from_percent(10)],
@@ -2808,6 +2970,7 @@ fn remove_deferred() {
 
 		mock::start_active_era(2);
 
+		// reported later, but deferred to start of era 4 as well.
 		on_offence_in_era(
 			&[OffenceDetails { offender: (11, exposure.clone()), reporters: vec![] }],
 			&[Perbill::from_percent(15)],
@@ -2821,7 +2984,8 @@ fn remove_deferred() {
 			Error::<Test>::EmptyTargets
 		);
 
-		assert_ok!(Staking::cancel_deferred_slash(Origin::root(), 1, vec![0]));
+		// cancel one of them.
+		assert_ok!(Staking::cancel_deferred_slash(Origin::root(), 4, vec![0]));
 
 		assert_eq!(Balances::free_balance(11), 1000);
 		assert_eq!(Balances::free_balance(101), 2000);
@@ -2833,13 +2997,19 @@ fn remove_deferred() {
 
 		// at the start of era 4, slashes from era 1 are processed,
 		// after being deferred for at least 2 full eras.
+		System::reset_events();
 		mock::start_active_era(4);
 
-		// the first slash for 10% was cancelled, so no effect.
-		assert_eq!(Balances::free_balance(11), 1000);
-		assert_eq!(Balances::free_balance(101), 2000);
-
-		mock::start_active_era(5);
+		// the first slash for 10% was cancelled, but the 15% one
+		assert_eq!(
+			staking_events_since_last_call(),
+			vec![
+				Event::StakersElected,
+				Event::EraPaid(3, 11075, 33225),
+				Event::Slashed(11, 50),
+				Event::Slashed(101, 7)
+			]
+		);
 
 		let slash_10 = Perbill::from_percent(10);
 		let slash_15 = Perbill::from_percent(15);
@@ -2892,7 +3062,7 @@ fn remove_multi_deferred() {
 			&[Perbill::from_percent(25)],
 		);
 
-		assert_eq!(<Staking as Store>::UnappliedSlashes::get(&1).len(), 5);
+		assert_eq!(<Staking as Store>::UnappliedSlashes::get(&4).len(), 5);
 
 		// fails if list is not sorted
 		assert_noop!(
@@ -2910,9 +3080,9 @@ fn remove_multi_deferred() {
 			Error::<Test>::InvalidSlashIndex
 		);
 
-		assert_ok!(Staking::cancel_deferred_slash(Origin::root(), 1, vec![0, 2, 4]));
+		assert_ok!(Staking::cancel_deferred_slash(Origin::root(), 4, vec![0, 2, 4]));
 
-		let slashes = <Staking as Store>::UnappliedSlashes::get(&1);
+		let slashes = <Staking as Store>::UnappliedSlashes::get(&4);
 		assert_eq!(slashes.len(), 2);
 		assert_eq!(slashes[0].validator, 21);
 		assert_eq!(slashes[1].validator, 42);
@@ -3314,7 +3484,7 @@ fn six_session_delay() {
 #[test]
 fn test_max_nominator_rewarded_per_validator_and_cant_steal_someone_else_reward() {
 	ExtBuilder::default().build_and_execute(|| {
-		for i in 0..=<Test as Config>::MaxNominatorRewardedPerValidator::get() {
+		for i in 0..=<<Test as Config>::MaxNominatorRewardedPerValidator as Get<_>>::get() {
 			let stash = 10_000 + i as AccountId;
 			let controller = 20_000 + i as AccountId;
 			let balance = 10_000 + i as Balance;
@@ -3337,7 +3507,7 @@ fn test_max_nominator_rewarded_per_validator_and_cant_steal_someone_else_reward(
 		mock::make_all_reward_payment(1);
 
 		// Assert only nominators from 1 to Max are rewarded
-		for i in 0..=<Test as Config>::MaxNominatorRewardedPerValidator::get() {
+		for i in 0..=<<Test as Config>::MaxNominatorRewardedPerValidator as Get<_>>::get() {
 			let stash = 10_000 + i as AccountId;
 			let balance = 10_000 + i as Balance;
 			if stash == 10_000 {
@@ -3370,26 +3540,47 @@ fn set_history_depth_works() {
 
 #[test]
 fn test_payout_stakers() {
-	// Here we will test validator can set `max_nominators_payout` and it works.
-	// We also test that `payout_extra_nominators` works.
+	// Test that payout_stakers work in general, including that only the top
+	// `T::MaxNominatorRewardedPerValidator` nominators are rewarded.
 	ExtBuilder::default().has_stakers(false).build_and_execute(|| {
 		let balance = 1000;
+		// Track the exposure of the validator and all nominators.
+		let mut total_exposure = balance;
+		// Track the exposure of the validator and the nominators that will get paid out.
+		let mut payout_exposure = balance;
 		// Create a validator:
 		bond_validator(11, 10, balance); // Default(64)
+		assert_eq!(Validators::<Test>::count(), 1);
 
 		// Create nominators, targeting stash of validators
 		for i in 0..100 {
-			bond_nominator(1000 + i, 100 + i, balance + i as Balance, vec![11]);
+			let bond_amount = balance + i as Balance;
+			bond_nominator(1000 + i, 100 + i, bond_amount, vec![11]);
+			total_exposure += bond_amount;
+			if i >= 36 {
+				payout_exposure += bond_amount;
+			};
 		}
+		let payout_exposure_part = Perbill::from_rational(payout_exposure, total_exposure);
 
 		mock::start_active_era(1);
 		Staking::reward_by_ids(vec![(11, 1)]);
 
 		// compute and ensure the reward amount is greater than zero.
-		let _ = current_total_payout_for_duration(reward_time_per_era());
+		let payout = current_total_payout_for_duration(reward_time_per_era());
+		let actual_paid_out = payout_exposure_part * payout;
 
 		mock::start_active_era(2);
+
+		let pre_payout_total_issuance = Balances::total_issuance();
+		RewardOnUnbalanceWasCalled::set(false);
 		assert_ok!(Staking::payout_stakers(Origin::signed(1337), 11, 1));
+		assert_eq_error_rate!(
+			Balances::total_issuance(),
+			pre_payout_total_issuance + actual_paid_out,
+			1
+		);
+		assert!(RewardOnUnbalanceWasCalled::get());
 
 		// Top 64 nominators of validator 11 automatically paid out, including the validator
 		// Validator payout goes to controller.
@@ -3418,10 +3609,19 @@ fn test_payout_stakers() {
 			Staking::reward_by_ids(vec![(11, 1)]);
 
 			// compute and ensure the reward amount is greater than zero.
-			let _ = current_total_payout_for_duration(reward_time_per_era());
+			let payout = current_total_payout_for_duration(reward_time_per_era());
+			let actual_paid_out = payout_exposure_part * payout;
+			let pre_payout_total_issuance = Balances::total_issuance();
 
 			mock::start_active_era(i);
+			RewardOnUnbalanceWasCalled::set(false);
 			assert_ok!(Staking::payout_stakers(Origin::signed(1337), 11, i - 1));
+			assert_eq_error_rate!(
+				Balances::total_issuance(),
+				pre_payout_total_issuance + actual_paid_out,
+				1
+			);
+			assert!(RewardOnUnbalanceWasCalled::get());
 		}
 
 		// We track rewards in `claimed_rewards` vec
@@ -3545,7 +3745,8 @@ fn payout_stakers_handles_weight_refund() {
 	// Note: this test relies on the assumption that `payout_stakers_alive_staked` is solely used by
 	// `payout_stakers` to calculate the weight of each payout op.
 	ExtBuilder::default().has_stakers(false).build_and_execute(|| {
-		let max_nom_rewarded = <Test as Config>::MaxNominatorRewardedPerValidator::get();
+		let max_nom_rewarded =
+			<<Test as Config>::MaxNominatorRewardedPerValidator as Get<_>>::get();
 		// Make sure the configured value is meaningful for our use.
 		assert!(max_nom_rewarded >= 4);
 		let half_max_nom_rewarded = max_nom_rewarded / 2;
@@ -3558,7 +3759,7 @@ fn payout_stakers_handles_weight_refund() {
 		let half_max_nom_rewarded_weight =
 			<Test as Config>::WeightInfo::payout_stakers_alive_staked(half_max_nom_rewarded);
 		let zero_nom_payouts_weight = <Test as Config>::WeightInfo::payout_stakers_alive_staked(0);
-		assert!(zero_nom_payouts_weight > 0);
+		assert!(zero_nom_payouts_weight > Weight::zero());
 		assert!(half_max_nom_rewarded_weight > zero_nom_payouts_weight);
 		assert!(max_nom_rewarded_weight > half_max_nom_rewarded_weight);
 
@@ -3697,42 +3898,68 @@ fn bond_during_era_correctly_populates_claimed_rewards() {
 fn offences_weight_calculated_correctly() {
 	ExtBuilder::default().nominate(true).build_and_execute(|| {
 		// On offence with zero offenders: 4 Reads, 1 Write
-		let zero_offence_weight = <Test as frame_system::Config>::DbWeight::get().reads_writes(4, 1);
-		assert_eq!(Staking::on_offence(&[], &[Perbill::from_percent(50)], 0, DisableStrategy::WhenSlashed), zero_offence_weight);
+		let zero_offence_weight =
+			<Test as frame_system::Config>::DbWeight::get().reads_writes(4, 1);
+		assert_eq!(
+			Staking::on_offence(&[], &[Perbill::from_percent(50)], 0, DisableStrategy::WhenSlashed),
+			zero_offence_weight
+		);
 
 		// On Offence with N offenders, Unapplied: 4 Reads, 1 Write + 4 Reads, 5 Writes
-		let n_offence_unapplied_weight = <Test as frame_system::Config>::DbWeight::get().reads_writes(4, 1)
-			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(4, 5);
+		let n_offence_unapplied_weight = <Test as frame_system::Config>::DbWeight::get()
+			.reads_writes(4, 1) +
+			<Test as frame_system::Config>::DbWeight::get().reads_writes(4, 5);
 
-		let offenders: Vec<OffenceDetails<<Test as frame_system::Config>::AccountId, pallet_session::historical::IdentificationTuple<Test>>>
-			= (1..10).map(|i|
-				OffenceDetails {
-					offender: (i, Staking::eras_stakers(active_era(), i)),
-					reporters: vec![],
-				}
-			).collect();
-		assert_eq!(Staking::on_offence(&offenders, &[Perbill::from_percent(50)], 0, DisableStrategy::WhenSlashed), n_offence_unapplied_weight);
+		let offenders: Vec<
+			OffenceDetails<
+				<Test as frame_system::Config>::AccountId,
+				pallet_session::historical::IdentificationTuple<Test>,
+			>,
+		> = (1..10)
+			.map(|i| OffenceDetails {
+				offender: (i, Staking::eras_stakers(active_era(), i)),
+				reporters: vec![],
+			})
+			.collect();
+		assert_eq!(
+			Staking::on_offence(
+				&offenders,
+				&[Perbill::from_percent(50)],
+				0,
+				DisableStrategy::WhenSlashed
+			),
+			n_offence_unapplied_weight
+		);
 
 		// On Offence with one offenders, Applied
-		let one_offender = [
-			OffenceDetails {
-				offender: (11, Staking::eras_stakers(active_era(), 11)),
-				reporters: vec![1],
-			},
-		];
+		let one_offender = [OffenceDetails {
+			offender: (11, Staking::eras_stakers(active_era(), 11)),
+			reporters: vec![1],
+		}];
 
 		let n = 1; // Number of offenders
 		let rw = 3 + 3 * n; // rw reads and writes
-		let one_offence_unapplied_weight = <Test as frame_system::Config>::DbWeight::get().reads_writes(4, 1)
-			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(rw, rw)
+		let one_offence_unapplied_weight =
+			<Test as frame_system::Config>::DbWeight::get().reads_writes(4, 1)
+		 +
+			<Test as frame_system::Config>::DbWeight::get().reads_writes(rw, rw)
 			// One `slash_cost`
 			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(6, 5)
 			// `slash_cost` * nominators (1)
 			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(6, 5)
 			// `reward_cost` * reporters (1)
-			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(2, 2);
+			+ <Test as frame_system::Config>::DbWeight::get().reads_writes(2, 2)
+		;
 
-		assert_eq!(Staking::on_offence(&one_offender, &[Perbill::from_percent(50)], 0, DisableStrategy::WhenSlashed), one_offence_unapplied_weight);
+		assert_eq!(
+			Staking::on_offence(
+				&one_offender,
+				&[Perbill::from_percent(50)],
+				0,
+				DisableStrategy::WhenSlashed
+			),
+			one_offence_unapplied_weight
+		);
 	});
 }
 
@@ -4023,7 +4250,7 @@ mod election_data_provider {
 	fn targets_2sec_block() {
 		let mut validators = 1000;
 		while <Test as Config>::WeightInfo::get_npos_targets(validators) <
-			2 * frame_support::weights::constants::WEIGHT_PER_SECOND
+			2u64 * frame_support::weights::constants::WEIGHT_PER_SECOND
 		{
 			validators += 1;
 		}
@@ -4041,7 +4268,7 @@ mod election_data_provider {
 		let mut nominators = 1000;
 
 		while <Test as Config>::WeightInfo::get_npos_voters(validators, nominators, slashing_spans) <
-			2 * frame_support::weights::constants::WEIGHT_PER_SECOND
+			2u64 * frame_support::weights::constants::WEIGHT_PER_SECOND
 		{
 			nominators += 1;
 		}
@@ -4598,10 +4825,20 @@ fn capped_stakers_works() {
 #[test]
 fn min_commission_works() {
 	ExtBuilder::default().build_and_execute(|| {
+		// account 10 controls the stash from account 11
 		assert_ok!(Staking::validate(
 			Origin::signed(10),
 			ValidatorPrefs { commission: Perbill::from_percent(5), blocked: false }
 		));
+
+		// event emitted should be correct
+		assert_eq!(
+			*staking_events().last().unwrap(),
+			Event::ValidatorPrefsSet(
+				11,
+				ValidatorPrefs { commission: Perbill::from_percent(5), blocked: false }
+			)
+		);
 
 		assert_ok!(Staking::set_staking_configs(
 			Origin::root(),
@@ -4813,4 +5050,235 @@ fn force_apply_min_commission_works() {
 			Error::<Test>::NotStash
 		);
 	});
+}
+
+#[test]
+fn proportional_slash_stop_slashing_if_remaining_zero() {
+	let c = |era, value| UnlockChunk::<Balance> { era, value };
+	// Given
+	let mut ledger = StakingLedger::<Test> {
+		stash: 123,
+		total: 40,
+		active: 20,
+		// we have some chunks, but they are not affected.
+		unlocking: bounded_vec![c(1, 10), c(2, 10)],
+		claimed_rewards: vec![],
+	};
+
+	assert_eq!(BondingDuration::get(), 3);
+
+	// should not slash more than the amount requested, by accidentally slashing the first chunk.
+	assert_eq!(ledger.slash(18, 1, 0), 18);
+}
+
+#[test]
+fn proportional_ledger_slash_works() {
+	let c = |era, value| UnlockChunk::<Balance> { era, value };
+	// Given
+	let mut ledger = StakingLedger::<Test> {
+		stash: 123,
+		total: 10,
+		active: 10,
+		unlocking: bounded_vec![],
+		claimed_rewards: vec![],
+	};
+	assert_eq!(BondingDuration::get(), 3);
+
+	// When we slash a ledger with no unlocking chunks
+	assert_eq!(ledger.slash(5, 1, 0), 5);
+	// Then
+	assert_eq!(ledger.total, 5);
+	assert_eq!(ledger.active, 5);
+	assert_eq!(LedgerSlashPerEra::get().0, 5);
+	assert_eq!(LedgerSlashPerEra::get().1, Default::default());
+
+	// When we slash a ledger with no unlocking chunks and the slash amount is greater then the
+	// total
+	assert_eq!(ledger.slash(11, 1, 0), 5);
+	// Then
+	assert_eq!(ledger.total, 0);
+	assert_eq!(ledger.active, 0);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, Default::default());
+
+	// Given
+	ledger.unlocking = bounded_vec![c(4, 10), c(5, 10)];
+	ledger.total = 2 * 10;
+	ledger.active = 0;
+	// When all the chunks overlap with the slash eras
+	assert_eq!(ledger.slash(20, 0, 0), 20);
+	// Then
+	assert_eq!(ledger.unlocking, vec![]);
+	assert_eq!(ledger.total, 0);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, BTreeMap::from([(4, 0), (5, 0)]));
+
+	// Given
+	ledger.unlocking = bounded_vec![c(4, 100), c(5, 100), c(6, 100), c(7, 100)];
+	ledger.total = 4 * 100;
+	ledger.active = 0;
+	// When the first 2 chunks don't overlap with the affected range of unlock eras.
+	assert_eq!(ledger.slash(140, 0, 3), 140);
+	// Then
+	assert_eq!(ledger.unlocking, vec![c(4, 100), c(5, 100), c(6, 30), c(7, 30)]);
+	assert_eq!(ledger.total, 4 * 100 - 140);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, BTreeMap::from([(6, 30), (7, 30)]));
+
+	// Given
+	ledger.unlocking = bounded_vec![c(4, 40), c(5, 100), c(6, 10), c(7, 250)];
+	ledger.active = 500;
+	// 900
+	ledger.total = 40 + 10 + 100 + 250 + 500;
+	// When we have a partial slash that touches all chunks
+	assert_eq!(ledger.slash(900 / 2, 0, 0), 450);
+	// Then
+	assert_eq!(ledger.active, 500 / 2);
+	assert_eq!(ledger.unlocking, vec![c(4, 40 / 2), c(5, 100 / 2), c(6, 10 / 2), c(7, 250 / 2)]);
+	assert_eq!(ledger.total, 900 / 2);
+	assert_eq!(LedgerSlashPerEra::get().0, 500 / 2);
+	assert_eq!(
+		LedgerSlashPerEra::get().1,
+		BTreeMap::from([(4, 40 / 2), (5, 100 / 2), (6, 10 / 2), (7, 250 / 2)])
+	);
+
+	// slash 1/4th with not chunk.
+	ledger.unlocking = bounded_vec![];
+	ledger.active = 500;
+	ledger.total = 500;
+	// When we have a partial slash that touches all chunks
+	assert_eq!(ledger.slash(500 / 4, 0, 0), 500 / 4);
+	// Then
+	assert_eq!(ledger.active, 3 * 500 / 4);
+	assert_eq!(ledger.unlocking, vec![]);
+	assert_eq!(ledger.total, ledger.active);
+	assert_eq!(LedgerSlashPerEra::get().0, 3 * 500 / 4);
+	assert_eq!(LedgerSlashPerEra::get().1, Default::default());
+
+	// Given we have the same as above,
+	ledger.unlocking = bounded_vec![c(4, 40), c(5, 100), c(6, 10), c(7, 250)];
+	ledger.active = 500;
+	ledger.total = 40 + 10 + 100 + 250 + 500; // 900
+	assert_eq!(ledger.total, 900);
+	// When we have a higher min balance
+	assert_eq!(
+		ledger.slash(
+			900 / 2,
+			25, /* min balance - chunks with era 0 & 2 will be slashed to <=25, causing it to
+			     * get swept */
+			0
+		),
+		450
+	);
+	assert_eq!(ledger.active, 500 / 2);
+	// the last chunk was not slashed 50% like all the rest, because some other earlier chunks got
+	// dusted.
+	assert_eq!(ledger.unlocking, vec![c(5, 100 / 2), c(7, 150)]);
+	assert_eq!(ledger.total, 900 / 2);
+	assert_eq!(LedgerSlashPerEra::get().0, 500 / 2);
+	assert_eq!(
+		LedgerSlashPerEra::get().1,
+		BTreeMap::from([(4, 0), (5, 100 / 2), (6, 0), (7, 150)])
+	);
+
+	// Given
+	// slash order --------------------NA--------2----------0----------1----
+	ledger.unlocking = bounded_vec![c(4, 40), c(5, 100), c(6, 10), c(7, 250)];
+	ledger.active = 500;
+	ledger.total = 40 + 10 + 100 + 250 + 500; // 900
+	assert_eq!(
+		ledger.slash(
+			500 + 10 + 250 + 100 / 2, // active + era 6 + era 7 + era 5 / 2
+			0,
+			3 /* slash era 6 first, so the affected parts are era 6, era 7 and
+			   * ledge.active. This will cause the affected to go to zero, and then we will
+			   * start slashing older chunks */
+		),
+		500 + 250 + 10 + 100 / 2
+	);
+	// Then
+	assert_eq!(ledger.active, 0);
+	assert_eq!(ledger.unlocking, vec![c(4, 40), c(5, 100 / 2)]);
+	assert_eq!(ledger.total, 90);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, BTreeMap::from([(5, 100 / 2), (6, 0), (7, 0)]));
+
+	// Given
+	// iteration order------------------NA---------2----------0----------1----
+	ledger.unlocking = bounded_vec![c(4, 100), c(5, 100), c(6, 100), c(7, 100)];
+	ledger.active = 100;
+	ledger.total = 5 * 100;
+	// When
+	assert_eq!(
+		ledger.slash(
+			351, // active + era 6 + era 7 + era 5 / 2 + 1
+			50,  // min balance - everything slashed below 50 will get dusted
+			3    /* slash era 3+3 first, so the affected parts are era 6, era 7 and
+			      * ledge.active. This will cause the affected to go to zero, and then we will
+			      * start slashing older chunks */
+		),
+		400
+	);
+	// Then
+	assert_eq!(ledger.active, 0);
+	assert_eq!(ledger.unlocking, vec![c(4, 100)]);
+	assert_eq!(ledger.total, 100);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, BTreeMap::from([(5, 0), (6, 0), (7, 0)]));
+
+	// Tests for saturating arithmetic
+
+	// Given
+	let slash = u64::MAX as Balance * 2;
+	// The value of the other parts of ledger that will get slashed
+	let value = slash - (10 * 4);
+
+	ledger.active = 10;
+	ledger.unlocking = bounded_vec![c(4, 10), c(5, 10), c(6, 10), c(7, value)];
+	ledger.total = value + 40;
+	// When
+	let slash_amount = ledger.slash(slash, 0, 0);
+	assert_eq_error_rate!(slash_amount, slash, 5);
+	// Then
+	assert_eq!(ledger.active, 0); // slash of 9
+	assert_eq!(ledger.unlocking, vec![]);
+	assert_eq!(ledger.total, 0);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(LedgerSlashPerEra::get().1, BTreeMap::from([(4, 0), (5, 0), (6, 0), (7, 0)]));
+
+	// Given
+	let slash = u64::MAX as Balance * 2;
+	let value = u64::MAX as Balance * 2;
+	let unit = 100;
+	// slash * value that will saturate
+	assert!(slash.checked_mul(value).is_none());
+	// but slash * unit won't.
+	assert!(slash.checked_mul(unit).is_some());
+	ledger.unlocking = bounded_vec![c(4, unit), c(5, value), c(6, unit), c(7, unit)];
+	//--------------------------------------note value^^^
+	ledger.active = unit;
+	ledger.total = unit * 4 + value;
+	// When
+	assert_eq!(ledger.slash(slash, 0, 0), slash - 43);
+	// Then
+	// The amount slashed out of `unit`
+	let affected_balance = value + unit * 4;
+	let ratio = Perquintill::from_rational(slash, affected_balance);
+	// `unit` after the slash is applied
+	let unit_slashed = {
+		let unit_slash = ratio * unit;
+		unit - unit_slash
+	};
+	let value_slashed = {
+		let value_slash = ratio * value;
+		value - value_slash
+	};
+	assert_eq!(ledger.active, unit_slashed);
+	assert_eq!(ledger.unlocking, vec![c(5, value_slashed)]);
+	assert_eq!(ledger.total, value_slashed);
+	assert_eq!(LedgerSlashPerEra::get().0, 0);
+	assert_eq!(
+		LedgerSlashPerEra::get().1,
+		BTreeMap::from([(4, 0), (5, value_slashed), (6, 0), (7, 0)])
+	);
 }
